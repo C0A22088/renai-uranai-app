@@ -1,5 +1,13 @@
 import "./style.css";
 
+/**
+ * MVP方針：AIなし / APIなし
+ * - 固定テンプレ + 日付seedで「毎日それっぽく変わる」占いを生成
+ * - 無料：short + luckyColorのみ
+ * - 有料：全文（各運勢/星/アドバイス等） -> 1pt消費で解放
+ * - ポイント：localStorage（Stripe導入は後で差し替え）
+ */
+
 const el = document.querySelector("#app");
 
 function html(strings, ...values) {
@@ -9,24 +17,7 @@ function $(sel) {
   return document.querySelector(sel);
 }
 
-/* ===== Date helpers (JST local date key) ===== */
-function getLocalDateKey(d = new Date()) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-function formatJaDate(d = new Date()) {
-  return d.toLocaleDateString("ja-JP", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    weekday: "short",
-  });
-}
-
-/* ===== Zodiac master ===== */
-const ZODIAC = [
+const ZODIACS = [
   { key: "aries", label: "牡羊座" },
   { key: "taurus", label: "牡牛座" },
   { key: "gemini", label: "双子座" },
@@ -41,272 +32,536 @@ const ZODIAC = [
   { key: "pisces", label: "魚座" },
 ];
 
-const stars = (n) => "★".repeat(n) + "☆".repeat(5 - n);
+const STORAGE = {
+  points: "ru_points",
+  unlockedPrefix: "ru_unlock_", // ru_unlock_YYYY-MM-DD_zodiacKey
+  selectedZodiac: "ru_selected_zodiac",
+};
 
-/* ===== State ===== */
-let statusText = "";
-let statusKind = ""; // "ok" | "ng" | ""
-let debugText = "";
-
-let selectedSign = localStorage.getItem("selected_sign") || "aries";
-let fortuneDateKey = getLocalDateKey();
-
-let fortuneData = null;
-
-/**
- * 単発課金（超簡易版）
- * - 決済成功URLに ?paid=1 を付けて戻す想定
- * - 当日分だけ localStorage 解放
- */
-function getPaidKey(dateKey) {
-  return `paid_${dateKey}`;
-}
-function isPaidToday(dateKey) {
-  return localStorage.getItem(getPaidKey(dateKey)) === "1";
-}
-function markPaidToday(dateKey) {
-  localStorage.setItem(getPaidKey(dateKey), "1");
+function todayStr() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
-// 決済成功で戻ってきた想定: ?paid=1
-(function handlePaidReturn() {
-  const url = new URL(window.location.href);
-  if (url.searchParams.get("paid") === "1") {
-    markPaidToday(getLocalDateKey());
-    url.searchParams.delete("paid");
-    window.history.replaceState({}, "", url.toString());
+function formatDateJP(d = new Date()) {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1);
+  const dd = String(d.getDate());
+  const w = ["日", "月", "火", "水", "木", "金", "土"][d.getDay()];
+  return `${yyyy}年${mm}月${dd}日(${w})`;
+}
+
+// ----- seed random (deterministic) -----
+function hash32(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
   }
-})();
-
-function setStatus(msg, kind = "") {
-  statusText = String(msg ?? "");
-  statusKind = kind;
-  const node = $("#status");
-  if (node) {
-    node.textContent = statusText;
-    node.className = `alert ${statusKind}`.trim();
-  }
+  return h >>> 0;
 }
-function setDebug(msg) {
-  debugText = String(msg ?? "");
-  const node = $("#debug");
-  if (node) node.textContent = debugText;
+function seededPick(arr, seedStr) {
+  const h = hash32(seedStr);
+  return arr[h % arr.length];
+}
+function seededInt(min, max, seedStr) {
+  const h = hash32(seedStr);
+  const n = h % (max - min + 1);
+  return min + n;
 }
 
-async function fetchFortune({ signKey, dateKey, paid }) {
-  const r = await fetch("/api/fortune", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ signKey, dateKey, paid }),
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(t);
-  }
-  return await r.json();
+// ----- fortune templates -----
+const TPL = {
+  short: [
+    "背伸び不要。等身大のままで好転します。",
+    "焦りは封印。丁寧に進めるほど味方が増えます。",
+    "小さな幸運は“選び直し”の先にあります。",
+    "今日は“言い切る”が鍵。迷いが消えます。",
+    "余白を作るほど流れが整います。",
+    "一歩引くと全体が見え、最短で進めます。",
+    "気合より習慣。淡々と続けるほど強い日です。",
+    "直感が冴える日。最初のひらめきを信じて。",
+  ],
+  love: [
+    "言葉より態度が伝わります。小さな気遣いが最強。",
+    "距離感を整えると関係が軽くなります。急がないで。",
+    "相手の“本音”は行動に出ます。観察が吉。",
+    "今日は甘え上手が勝ち。素直に頼ると進展。",
+    "未読・既読に揺れない。あなたのペースを守って。",
+  ],
+  work: [
+    "段取りが勝負。先にToDoを3つに絞ると速い。",
+    "確認を一手間。ミスが減って信頼が積み上がる。",
+    "今日は“話す”より“書く”が強い。メモで整理。",
+    "小さな改善が大きな評価に。やり方を1つ変える。",
+    "即レスより良レス。要点を短くまとめると刺さる。",
+  ],
+  money: [
+    "買うより整える日。固定費の見直しで余裕が生まれます。",
+    "迷ったら保留が正解。衝動買いは明日まで寝かせて。",
+    "小さな投資が効く日。消耗品より“使い回せるもの”。",
+    "出費は“未来の自分の時間”を買っているかで判断。",
+    "ポイントは貯めどき。使うのは“効果が見えるもの”へ。",
+  ],
+  advice: [
+    "今日の一手：睡眠・水分を最優先でコンディションを整える。",
+    "今日の一手：予定を詰め込みすぎ注意。余白が運を呼びます。",
+    "今日の一手：3分だけ片付ける。視界が整うと心も整います。",
+    "今日の一手：LINEは短く温かく。結論→一言で好印象。",
+    "今日の一手：深呼吸してから返事。言葉が柔らかくなります。",
+  ],
+  luckyColor: ["ホワイト", "ネイビー", "ラベンダー", "アイボリー", "ブラック", "ミント", "ボルドー", "シルバー"],
+  luckyItem: ["リップクリーム", "イヤホン", "ハンドクリーム", "ミニノート", "ミントガム", "白い靴下", "香水", "ボールペン"],
+  luckyTime: ["07:20", "09:10", "12:40", "15:20", "17:50", "19:05", "21:30", "23:00"],
+};
+
+function buildFortune(zodiacKey, dateStr) {
+  const seedBase = `${dateStr}_${zodiacKey}`;
+
+  const overall = seededInt(2, 5, `${seedBase}_overall`);
+  const loveStars = seededInt(1, 5, `${seedBase}_loveStars`);
+  const workStars = seededInt(1, 5, `${seedBase}_workStars`);
+  const moneyStars = seededInt(1, 5, `${seedBase}_moneyStars`);
+
+  return {
+    date: dateStr,
+    zodiacKey,
+    title: "今日の運勢",
+    short: seededPick(TPL.short, `${seedBase}_short`),
+    luckyColor: seededPick(TPL.luckyColor, `${seedBase}_lc`),
+
+    // paid-only fields
+    summary: "人との会話が鍵。短いやり取りが運を開きます。",
+    overall,
+    loveStars,
+    workStars,
+    moneyStars,
+    loveText: seededPick(TPL.love, `${seedBase}_love`),
+    workText: seededPick(TPL.work, `${seedBase}_work`),
+    moneyText: seededPick(TPL.money, `${seedBase}_money`),
+    advice: seededPick(TPL.advice, `${seedBase}_advice`),
+    luckyItem: seededPick(TPL.luckyItem, `${seedBase}_li`),
+    luckyTime: seededPick(TPL.luckyTime, `${seedBase}_lt`),
+  };
 }
 
-function renderStarsRow(scores) {
+// ----- points / unlock -----
+function getPoints() {
+  return Number(localStorage.getItem(STORAGE.points) || "0");
+}
+function setPoints(n) {
+  localStorage.setItem(STORAGE.points, String(Math.max(0, n)));
+}
+function addPoints(n) {
+  setPoints(getPoints() + n);
+}
+
+function unlockKey(dateStr, zodiacKey) {
+  return `${STORAGE.unlockedPrefix}${dateStr}_${zodiacKey}`;
+}
+function isUnlocked(dateStr, zodiacKey) {
+  return localStorage.getItem(unlockKey(dateStr, zodiacKey)) === "1";
+}
+function setUnlocked(dateStr, zodiacKey) {
+  localStorage.setItem(unlockKey(dateStr, zodiacKey), "1");
+}
+
+// 消費して解放（1pt）
+function spendToUnlock(dateStr, zodiacKey, cost = 1) {
+  const p = getPoints();
+  if (isUnlocked(dateStr, zodiacKey)) return { ok: true, already: true };
+  if (p < cost) return { ok: false, reason: "no_points" };
+  setPoints(p - cost);
+  setUnlocked(dateStr, zodiacKey);
+  return { ok: true };
+}
+
+// ----- UI components -----
+function starBar(n) {
+  const on = Math.max(0, Math.min(5, Number(n) || 0));
   return html`
-    <div class="stars-row">
-      <div class="star-pill"><span>総合</span><b>${stars(scores.overall)}</b></div>
-      <div class="star-pill"><span>恋愛</span><b>${stars(scores.love)}</b></div>
-      <div class="star-pill"><span>仕事</span><b>${stars(scores.work)}</b></div>
-      <div class="star-pill"><span>金運</span><b>${stars(scores.money)}</b></div>
+    <div class="starbar">
+      ${Array.from({ length: 5 }).map(
+        (_, i) => html`<span class="star ${i < on ? "is-on" : ""}"></span>`
+      )}
+      <span class="starbar-num">${on}/5</span>
     </div>
   `;
 }
 
-async function loadAndRender() {
-  // 日付跨ぎに追従
-  const todayKey = getLocalDateKey();
-  if (fortuneDateKey !== todayKey) fortuneDateKey = todayKey;
-
-  const signObj = ZODIAC.find((z) => z.key === selectedSign) || ZODIAC[0];
-  const paid = isPaidToday(fortuneDateKey);
-
-  try {
-    setStatus("占い結果を取得中…");
-    fortuneData = await fetchFortune({ signKey: signObj.key, dateKey: fortuneDateKey, paid });
-    setStatus("表示しました。", "ok");
-    setDebug(`date_key: ${fortuneDateKey}\nsign: ${selectedSign}\npaid: ${paid}`);
-  } catch (e) {
-    setStatus("取得に失敗しました。", "ng");
-    setDebug(e?.message || String(e));
-    fortuneData = null;
-  }
-
-  await render();
-}
-
-async function render() {
-  const signObj = ZODIAC.find((z) => z.key === selectedSign) || ZODIAC[0];
-  const paid = isPaidToday(fortuneDateKey);
-
-  el.innerHTML = html`
-    <header class="app-header">
-      <div class="hero">
-        <div class="hero-left">
-          <div class="hero-badge">TODAY</div>
-          <h1 class="app-title">今日の運勢</h1>
-          <p class="app-sub">${formatJaDate(new Date())}</p>
-        </div>
-        <div class="hero-right">
-          <div class="hero-mini">
-            <div class="hero-mini-label">モード</div>
-            <div class="hero-mini-value">${paid ? "全文：解放済み（単発）" : "無料：ダイジェスト"}</div>
+function lockedBlock({ title, sub, costLabel, onUnlock }) {
+  return html`
+    <div class="locked-box">
+      <div class="locked-blur">
+        <div class="locked-preview">
+          <div class="preview-title">${title}</div>
+          <div class="skeleton">
+            <div class="sk-line" style="width: 84%"></div>
+            <div class="sk-line" style="width: 66%"></div>
+            <div class="sk-line" style="width: 72%"></div>
           </div>
         </div>
       </div>
-    </header>
 
-    <div class="grid">
-      <div id="status" class="alert ${statusKind}">${statusText}</div>
-
-      <section class="card">
-        <div class="topbar">
-          <div>
-            <h2 class="card-title">星座を選んでください</h2>
-            <p class="app-sub" style="margin-top:6px;">選ぶと即表示。無料は短文＋ラッキー、解放で全文。</p>
-          </div>
-          <div class="topbar-right">
-            <span class="badge">${paid ? "全文：解放済み" : "全文：ロック中"}</span>
-            <button id="refresh" class="btn">更新</button>
-          </div>
+      <div class="locked-overlay">
+        <div class="lock-icon">🔒</div>
+        <div class="lock-title">${title}はロック中</div>
+        <div class="lock-sub">${sub}</div>
+        <div class="lock-actions">
+          <button class="btn primary" data-action="${onUnlock}">
+            全文を見る（${costLabel}）
+          </button>
+          <button class="btn ghost" data-action="open-buy">
+            ポイント購入
+          </button>
         </div>
+      </div>
+    </div>
+  `;
+}
 
-        <div style="height:12px;"></div>
+function zodiacWheel(selectedKey) {
+  const idx = Math.max(0, ZODIACS.findIndex((z) => z.key === selectedKey));
+  return html`
+    <div class="zodiac-wheel-wrap">
+      <div class="zodiac-wheel-title">星座を選んでください</div>
+      <div class="zodiac-wheel-sub">左右にスライドして選択（中央が選択状態）</div>
 
-        <div class="zodiac-grid">
-          ${ZODIAC.map((z) => {
-            const active = z.key === selectedSign;
+      <div class="zodiac-wheel" id="zodiacWheel" aria-label="Zodiac wheel">
+        <div class="zodiac-wheel-inner" id="zodiacWheelInner">
+          ${ZODIACS.map((z) => {
+            const active = z.key === selectedKey;
             return html`
-              <button class="zodiac-card ${active ? "is-active" : ""}" data-sign="${z.key}">
-                <div class="zodiac-name">${z.label}</div>
-                <div class="zodiac-sub">${active ? "選択中" : "選ぶ"}</div>
+              <button
+                class="zodiac-pill ${active ? "is-active" : ""}"
+                type="button"
+                data-zodiac="${z.key}"
+              >
+                ${z.label}
               </button>
             `;
           }).join("")}
         </div>
+
+        <div class="zodiac-wheel-center" aria-hidden="true"></div>
+        <div class="zodiac-wheel-fade left" aria-hidden="true"></div>
+        <div class="zodiac-wheel-fade right" aria-hidden="true"></div>
+      </div>
+
+      <div class="zodiac-wheel-selected">
+        選択中：<b>${ZODIACS[idx]?.label ?? "-"}</b>
+      </div>
+    </div>
+  `;
+}
+
+function buyModal(points) {
+  return html`
+    <div class="modal-backdrop" data-action="close-buy">
+      <div class="modal" role="dialog" aria-modal="true" aria-label="Buy points" onclick="event.stopPropagation()">
+        <div class="modal-head">
+          <div class="modal-title">ポイント購入</div>
+          <button class="icon-btn" data-action="close-buy" aria-label="Close">✕</button>
+        </div>
+
+        <div class="modal-body">
+          <div class="muted">現在のポイント：<b>${points}pt</b></div>
+
+          <div class="buy-cards">
+            <div class="buy-card">
+              <div class="buy-name">テスト：+1pt</div>
+              <div class="buy-sub">今は導線検証用（あとでStripeに差し替え）</div>
+              <button class="btn primary" data-action="buy-1">+1pt 追加</button>
+            </div>
+            <div class="buy-card">
+              <div class="buy-name">テスト：+10pt</div>
+              <div class="buy-sub">まとめて解放したい人向け</div>
+              <button class="btn primary" data-action="buy-10">+10pt 追加</button>
+            </div>
+          </div>
+
+          <div class="note">
+            <b>本番Stripeにする場合：</b><br/>
+            このボタンを「Stripe Checkout / Payment Link」に差し替えるだけでOKです。<br/>
+            まずは“買いたくなる導線”と“解放体験”を固めましょう。
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function render(state) {
+  const { dateStr, selectedZodiac, fortune, unlocked, points, showBuy } = state;
+  const zodiacLabel = ZODIACS.find((z) => z.key === selectedZodiac)?.label ?? "";
+
+  el.innerHTML = html`
+    <div class="bg"></div>
+
+    <div class="container">
+      <header class="hero">
+        <div class="hero-badge">TODAY</div>
+        <div class="hero-title">今日の運勢</div>
+        <div class="hero-sub">${formatDateJP(new Date())}</div>
+
+        <div class="hero-right">
+          <div class="pill">
+            <span class="pill-k">モード</span>
+            <span class="pill-v">無料：ダイジェスト</span>
+          </div>
+          <div class="pill">
+            <span class="pill-k">ポイント</span>
+            <span class="pill-v"><b>${points}pt</b></span>
+            <button class="mini-btn" data-action="open-buy">購入</button>
+          </div>
+        </div>
+      </header>
+
+      <section class="panel">
+        ${zodiacWheel(selectedZodiac)}
+
+        <div class="panel-actions">
+          <div class="panel-left">
+            <span class="tag">選択：<b>${zodiacLabel}</b></span>
+            <span class="tag">無料：運勢＋ラッキーカラー</span>
+          </div>
+          <div class="panel-right">
+            <button class="btn ghost" data-action="refresh">更新</button>
+          </div>
+        </div>
       </section>
 
       <section class="card">
-        <div class="fortune-head">
+        <div class="card-head">
           <div>
-            <h2 class="card-title">${fortuneData?.digest?.title ?? `${signObj.label}の今日の運勢`}</h2>
-            <p class="app-sub" style="margin-top:6px;">${fortuneData?.digest?.theme ?? "読み込み中…"}</p>
+            <div class="card-title">${zodiacLabel}の${fortune.title}</div>
+            <div class="card-sub">無料で見れるのは「短文」と「ラッキーカラー」だけです。</div>
           </div>
-          <div class="fortune-actions">
-            <span class="badge">無料：1〜2文＋ラッキー</span>
-          </div>
+          <div class="kicker">無料：1〜2文 + ラッキー</div>
         </div>
 
-        <div style="height:12px;"></div>
+        <div class="fortune-free">
+          <div class="free-row">
+            <div class="free-label">今日の運勢</div>
+            <div class="free-text">${fortune.short}</div>
+          </div>
 
-        ${
-          fortuneData
-            ? html`
-                <div class="fortune-digest">
-                  <div class="fortune-one">${fortuneData.digest.oneLine}</div>
-                  <div style="height:10px;"></div>
-                  ${renderStarsRow(fortuneData.digest.scores)}
-                  <div style="height:12px;"></div>
-
-                  <div class="fortune-tips">
-                    <div><b>今日の一手：</b>${fortuneData.digest.tips.action}</div>
-                    <div><b>注意：</b>${fortuneData.digest.tips.caution}</div>
-                    <div><b>ラッキー：</b>ラッキーカラー：${fortuneData.digest.tips.lucky.color}／ラッキーアイテム：${fortuneData.digest.tips.lucky.item}／ラッキータイム：${fortuneData.digest.tips.lucky.time}</div>
-                  </div>
-                </div>
-              `
-            : html`<p class="app-sub">読み込みに失敗しました。更新を押してください。</p>`
-        }
+          <div class="lucky-pill">
+            <span>ラッキーカラー</span>
+            <b>${fortune.luckyColor}</b>
+          </div>
+        </div>
       </section>
 
       <section class="card">
         <div class="lock-head">
-          <h2 class="card-title">全文（詳細）</h2>
-          <span class="badge">${paid ? "解放済み" : "ロック中"}</span>
+          <div>
+            <div class="card-title">全文（詳細）</div>
+            <div class="card-sub">恋愛/仕事/金運、星評価、アドバイス、ラッキーアイテムなど</div>
+          </div>
+          <div class="kicker">${unlocked ? "解放済み" : "ロック中"}</div>
         </div>
 
-        <div style="height:12px;"></div>
-
         ${
-          paid && fortuneData
+          unlocked
             ? html`
-                <div class="fortune-full">
-                  <h4>総合</h4><p>${fortuneData.full.overall}</p>
-                  <h4>恋愛</h4><p>${fortuneData.full.love}</p>
-                  <h4>仕事・学業</h4><p>${fortuneData.full.work}</p>
-                  <h4>金運</h4><p>${fortuneData.full.money}</p>
-                </div>
-              `
-            : html`
-                <div class="locked-box">
-                  <div class="locked-blur">
-                    <div class="fortune-full">
-                      <h4>総合</h4><p>${fortuneData?.full?.overall ?? "（ここに全文が表示されます）"}</p>
-                      <h4>恋愛</h4><p>${fortuneData?.full?.love ?? "（ここに全文が表示されます）"}</p>
-                      <h4>仕事・学業</h4><p>${fortuneData?.full?.work ?? "（ここに全文が表示されます）"}</p>
-                      <h4>金運</h4><p>${fortuneData?.full?.money ?? "（ここに全文が表示されます）"}</p>
+                <div class="fortune-paid">
+                  <div class="paid-block">
+                    <div class="paid-head">
+                      <div class="paid-title">概要</div>
+                      <div class="kicker">PAID</div>
+                    </div>
+                    <div class="paid-summary">${fortune.summary}</div>
+                  </div>
+
+                  <div class="paid-block">
+                    <div class="paid-head">
+                      <div class="paid-title">運勢（★）</div>
+                      <div class="kicker">PAID</div>
+                    </div>
+
+                    <div class="paid-grid">
+                      <div class="paid-card">
+                        <div class="kicker">総合</div>
+                        ${starBar(fortune.overall)}
+                      </div>
+                      <div class="paid-card">
+                        <div class="kicker">恋愛</div>
+                        ${starBar(fortune.loveStars)}
+                        <div class="axis-text">${fortune.loveText}</div>
+                      </div>
+                      <div class="paid-card">
+                        <div class="kicker">仕事</div>
+                        ${starBar(fortune.workStars)}
+                        <div class="axis-text">${fortune.workText}</div>
+                      </div>
+                      <div class="paid-card">
+                        <div class="kicker">金運</div>
+                        ${starBar(fortune.moneyStars)}
+                        <div class="axis-text">${fortune.moneyText}</div>
+                      </div>
                     </div>
                   </div>
 
-                  <div class="locked-overlay">
-                    <div class="lock-title">全文は単発課金で解放</div>
-                    <div class="lock-sub">このセッション＋当日分だけ解放（最短運用）。</div>
-                    <div style="height:12px;"></div>
-                    <div class="row" style="justify-content:center; flex-wrap:wrap;">
-                      <button id="buy" class="btn btn-primary">全文を見る（単発）</button>
-                      <span class="badge">まずは導線検証</span>
+                  <div class="paid-block">
+                    <div class="paid-head">
+                      <div class="paid-title">今日の一手</div>
+                      <div class="kicker">PAID</div>
                     </div>
+                    <div class="template-text">${fortune.advice}</div>
+                  </div>
+
+                  <div class="paid-lucky">
+                    <div class="paid-head">
+                      <div class="paid-title">ラッキー</div>
+                      <div class="kicker">PAID</div>
+                    </div>
+                    <ul class="list">
+                      <li><b>ラッキーアイテム：</b>${fortune.luckyItem}</li>
+                      <li><b>ラッキータイム：</b>${fortune.luckyTime}</li>
+                      <li><b>ラッキーカラー：</b>${fortune.luckyColor}</li>
+                    </ul>
                   </div>
                 </div>
               `
+            : lockedBlock({
+                title: "全文（詳細）",
+                sub: "ポイントを使うと、この星座の“今日の全文”が解放されます（同じ日付は再課金なし）。",
+                costLabel: "1pt",
+                onUnlock: "unlock-full",
+              })
         }
       </section>
 
-      <section class="card">
-        <h2 class="card-title">デバッグ（開発用）</h2>
-        <div style="height:10px;"></div>
-        <details class="details">
-          <summary>ログを見る</summary>
-          <div class="content">
-            <pre id="debug">${debugText}</pre>
-          </div>
-        </details>
-      </section>
+      ${showBuy ? buyModal(points) : ""}
     </div>
   `;
-
-  // handlers
-  $("#refresh").onclick = loadAndRender;
-
-  document.querySelectorAll("[data-sign]").forEach((btn) => {
-    btn.onclick = async () => {
-      const key = btn.getAttribute("data-sign");
-      if (!key) return;
-      selectedSign = key;
-      localStorage.setItem("selected_sign", selectedSign);
-      await loadAndRender();
-    };
-  });
-
-  const buyBtn = $("#buy");
-  if (buyBtn) {
-    buyBtn.onclick = () => {
-      /**
-       * Stripe最短：Payment Linkに飛ばす（ノーWebhook）
-       * - Stripe側の success_url を「あなたのURL?paid=1」にする
-       * - 例: https://your-app.vercel.app/?paid=1
-       *
-       * ここはあなたの Payment Link に置き換え
-       */
-      const PAYMENT_LINK_URL = "https://YOUR_STRIPE_PAYMENT_LINK";
-      window.location.href = PAYMENT_LINK_URL;
-    };
-  }
 }
 
-setStatus("読み込み中…");
-loadAndRender();
+function attachHandlers(state) {
+  // wheel: scroll-snapで中央選択
+  const wheel = $("#zodiacWheel");
+  const inner = $("#zodiacWheelInner");
+  if (wheel && inner) {
+    // 初回：選択中を中央に寄せる
+    const active = inner.querySelector(`.zodiac-pill.is-active`);
+    if (active) {
+      const left = active.offsetLeft - (wheel.clientWidth / 2 - active.clientWidth / 2);
+      wheel.scrollLeft = Math.max(0, left);
+    }
+
+    let scrollTimer = null;
+    wheel.addEventListener("scroll", () => {
+      if (scrollTimer) clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => {
+        // 中央に近いpillを選択
+        const centerX = wheel.scrollLeft + wheel.clientWidth / 2;
+        const pills = Array.from(inner.querySelectorAll(".zodiac-pill"));
+        let best = null;
+        let bestDist = Infinity;
+        for (const p of pills) {
+          const px = p.offsetLeft + p.clientWidth / 2;
+          const d = Math.abs(px - centerX);
+          if (d < bestDist) {
+            bestDist = d;
+            best = p;
+          }
+        }
+        if (best) {
+          const k = best.dataset.zodiac;
+          if (k && k !== state.selectedZodiac) {
+            localStorage.setItem(STORAGE.selectedZodiac, k);
+            boot(); // 再描画
+          }
+        }
+      }, 120);
+    });
+
+    inner.addEventListener("click", (e) => {
+      const btn = e.target.closest(".zodiac-pill");
+      if (!btn) return;
+      const k = btn.dataset.zodiac;
+      if (!k) return;
+
+      // タップしたpillを中央へ
+      const left = btn.offsetLeft - (wheel.clientWidth / 2 - btn.clientWidth / 2);
+      wheel.scrollTo({ left: Math.max(0, left), behavior: "smooth" });
+
+      if (k !== state.selectedZodiac) {
+        localStorage.setItem(STORAGE.selectedZodiac, k);
+        setTimeout(() => boot(), 180);
+      }
+    });
+  }
+
+  document.addEventListener("click", (e) => {
+    const a = e.target.closest("[data-action]");
+    if (!a) return;
+    const action = a.dataset.action;
+
+    if (action === "refresh") {
+      boot(true);
+      return;
+    }
+
+    if (action === "open-buy") {
+      boot(false, { showBuy: true });
+      return;
+    }
+    if (action === "close-buy") {
+      boot(false, { showBuy: false });
+      return;
+    }
+
+    if (action === "buy-1") {
+      addPoints(1);
+      boot(false, { showBuy: false });
+      return;
+    }
+    if (action === "buy-10") {
+      addPoints(10);
+      boot(false, { showBuy: false });
+      return;
+    }
+
+    if (action === "unlock-full") {
+      const res = spendToUnlock(state.dateStr, state.selectedZodiac, 1);
+      if (!res.ok) {
+        boot(false, { showBuy: true });
+        return;
+      }
+      boot();
+      return;
+    }
+  });
+}
+
+// ----- boot -----
+function boot(forceReroll = false, patch = {}) {
+  const dateStr = todayStr();
+  const selectedZodiac = localStorage.getItem(STORAGE.selectedZodiac) || "aries";
+
+  // テンプレ生成（毎日固定）
+  // forceRerollは将来「時間帯」等で変化させる場合の余地。今は同じ結果でOK
+  const fortune = buildFortune(selectedZodiac, dateStr);
+  const points = getPoints();
+  const unlocked = isUnlocked(dateStr, selectedZodiac);
+
+  const state = {
+    dateStr,
+    selectedZodiac,
+    fortune,
+    unlocked,
+    points,
+    showBuy: false,
+    ...patch,
+  };
+
+  render(state);
+  attachHandlers(state);
+}
+
+boot();
